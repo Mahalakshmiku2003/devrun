@@ -1,15 +1,19 @@
 #include "process.hpp"
+#include "config.hpp"
 #include <cstdio>
 #include <vector>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
-int main() {
-    std::vector<Service> services = {
-        {"a", "for i in 1 2 3; do echo tick $i; sleep 1; done"},
-        {"b", "for i in 1 2; do echo tock $i; sleep 1.5; done; ls /nonexistent"},
-    };
+int main(int argc, char** argv) {
+    std::vector<Service> services;
+    std::string error;
+    const char* path = (argc > 1) ? argv[1] : "devrun.conf";
+    if (!load_config(path, services, error)) {
+        fprintf(stderr, "config error: %s\n", error.c_str());
+        return 1;
+    }
 
     for (auto& s : services) {
         if (!start_service(s)) printf("[%s] failed to start\n", s.name.c_str());
