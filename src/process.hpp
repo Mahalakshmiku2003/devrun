@@ -6,10 +6,14 @@
 struct Service {
     std::string name;
     std::string command;
-    std::vector<std::string> needs;   // names of services this one depends on
-    bool started = false;             // has it been started at least once?
-    int fd = -1;                      // reading end of its output tube (-1 = not running)
-    std::string buf;                  // partial line waiting for its newline
+    std::vector<std::string> needs;
+    int ready_port = 0;               // 0 = no health check; ready as soon as started
+    bool started = false;
+    bool ready = false;
+    bool failed = false;              // gave up, or a dependency failed
+    long long started_at_ms = 0;
+    int fd = -1;
+    std::string buf;
     pid_t pid = -1;
     int restarts = 0;
     long long restart_at_ms = 0;

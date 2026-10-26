@@ -1,5 +1,6 @@
 #include "process.hpp"
 #include "config.hpp"
+#include "health.hpp"
 #include <chrono>
 #include <csignal>
 #include <cerrno>
@@ -11,6 +12,8 @@
 
 static const int MAX_RESTARTS = 5;
 static const int GRACE_MS = 3000;
+static const int READY_TIMEOUT_MS = 15000;
+static const int CHECK_INTERVAL_MS = 200;
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
@@ -18,6 +21,17 @@ static void on_signal(int) { g_stop = 1; }
 static long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static Service* find_service(std::vector<Service>& v, const std::string& name) {
+    for (auto& s : v) if (s.name == name) return &s;
+    return nullptr;
+}
+
+static void mark_started(Service& s) {
+    s.started = true;
+    s.started_at_ms = now_ms();
+    s.ready = (s.ready_port == 0);   // no health check: ready right away
 }
 
 static void shutdown_all(std::vector<Service>& services) {
@@ -76,31 +90,50 @@ int main(int argc, char** argv) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Services are already sorted so dependencies come first.
     printf("start order:");
     for (auto& s : services) printf(" %s", s.name.c_str());
     printf("\n");
-
-    for (auto& s : services) {
-        bool blocked = false;
-        for (auto& n : s.needs) {
-            for (auto& other : services) {
-                if (other.name == n && !other.started) blocked = true;
-            }
-        }
-        if (blocked) {
-            printf("[%s] not started: a dependency failed to start\n", s.name.c_str());
-            continue;
-        }
-        if (start_service(s)) s.started = true;
-        else printf("[%s] failed to start\n", s.name.c_str());
-    }
     fflush(stdout);
 
     while (!g_stop) {
+        // A. Start services whose dependencies are ready; check readiness of the rest.
+        for (auto& s : services) {
+            if (s.failed) continue;
+
+            if (!s.started) {
+                bool all_ready = true;
+                bool dep_failed = false;
+                for (auto& n : s.needs) {
+                    Service* d = find_service(services, n);
+                    if (d->failed) dep_failed = true;
+                    else if (!d->ready) all_ready = false;
+                }
+                if (dep_failed) {
+                    printf("[%s] not started: a dependency failed\n", s.name.c_str());
+                    s.failed = true;
+                } else if (all_ready) {
+                    if (start_service(s)) mark_started(s);
+                    else { printf("[%s] failed to start\n", s.name.c_str()); s.failed = true; }
+                }
+            } else if (!s.ready) {
+                if (tcp_check(s.ready_port)) {
+                    s.ready = true;
+                    printf("[%s] ready (port %d is accepting connections)\n",
+                           s.name.c_str(), s.ready_port);
+                } else if (now_ms() - s.started_at_ms > READY_TIMEOUT_MS) {
+                    printf("[%s] not ready after %d s, giving up on it\n",
+                           s.name.c_str(), READY_TIMEOUT_MS / 1000);
+                    s.failed = true;
+                }
+            }
+        }
+        fflush(stdout);
+
+        // B. Decide how long poll may sleep.
         long long now = now_ms();
         int timeout = -1;
         bool pending = false;
+        bool waiting = false;
         for (auto& s : services) {
             if (s.restart_at_ms > 0) {
                 pending = true;
@@ -108,7 +141,9 @@ int main(int argc, char** argv) {
                 if (wait < 0) wait = 0;
                 if (timeout < 0 || wait < timeout) timeout = (int)wait;
             }
+            if (!s.failed && (!s.started || !s.ready)) waiting = true;
         }
+        if (waiting && (timeout < 0 || timeout > CHECK_INTERVAL_MS)) timeout = CHECK_INTERVAL_MS;
 
         std::vector<pollfd> fds;
         std::vector<int> who;
@@ -118,7 +153,7 @@ int main(int argc, char** argv) {
                 who.push_back(i);
             }
         }
-        if (fds.empty() && !pending) break;
+        if (fds.empty() && !pending && !waiting) break;
 
         int r = poll(fds.data(), fds.size(), timeout);
         if (r < 0) {
@@ -126,6 +161,7 @@ int main(int argc, char** argv) {
             break;
         }
 
+        // C. Read output / detect exits.
         for (size_t k = 0; k < fds.size(); k++) {
             if (!fds[k].revents) continue;
             Service& s = services[who[k]];
@@ -158,19 +194,22 @@ int main(int argc, char** argv) {
                                s.name.c_str(), delay / 1000, s.restarts, MAX_RESTARTS);
                     } else {
                         printf("[%s] crashed too many times, giving up\n", s.name.c_str());
+                        s.failed = true;
                     }
                 }
             }
             fflush(stdout);
         }
 
+        // D. Restart services whose time has come.
         now = now_ms();
         for (auto& s : services) {
             if (s.restart_at_ms > 0 && now >= s.restart_at_ms) {
                 s.restart_at_ms = 0;
                 s.buf.clear();
                 printf("[%s] restarting now\n", s.name.c_str());
-                if (!start_service(s)) printf("[%s] failed to start\n", s.name.c_str());
+                if (start_service(s)) mark_started(s);
+                else printf("[%s] failed to start\n", s.name.c_str());
                 fflush(stdout);
             }
         }

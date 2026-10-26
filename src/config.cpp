@@ -23,8 +23,6 @@ static std::vector<std::string> split_commas(const std::string& s) {
     return out;
 }
 
-// Checks dependencies and reorders services so every service comes after
-// the ones it needs. Fails on unknown names, duplicates and cycles.
 static bool order_services(std::vector<Service>& svcs, std::string& error) {
     std::set<std::string> names;
     for (auto& s : svcs) {
@@ -118,8 +116,20 @@ bool load_config(const std::string& path, std::vector<Service>& out, std::string
             svcs.back().command = value;
         } else if (key == "needs") {
             svcs.back().needs = split_commas(value);
+        } else if (key == "ready") {
+            if (value.rfind("port ", 0) != 0) {
+                error = where + "expected 'ready = port NUMBER'";
+                return false;
+            }
+            int port = 0;
+            try { port = std::stoi(trim(value.substr(5))); } catch (...) { port = 0; }
+            if (port < 1 || port > 65535) {
+                error = where + "invalid port number";
+                return false;
+            }
+            svcs.back().ready_port = port;
         } else {
-            error = where + "unknown key '" + key + "' (use cmd or needs)";
+            error = where + "unknown key '" + key + "' (use cmd, needs or ready)";
             return false;
         }
     }
