@@ -11,6 +11,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -21,7 +22,9 @@ static const int GRACE_MS = 3000;
 static const int READY_TIMEOUT_MS = 15000;
 static const int CHECK_INTERVAL_MS = 200;
 static const int STABLE_MS = 60000;
+static const size_t HISTORY_LINES = 500;
 static const char* SOCK_PATH = ".devrun.sock";
+static const char* LOG_PATH = ".devrun.log";
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
@@ -35,28 +38,37 @@ static long long now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-static void emit(const char* name, int color, const char* msg) {
+static std::string stamp() {
     time_t t = time(nullptr);
     struct tm tmv;
     localtime_r(&t, &tmv);
     char ts[16];
     strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    return ts;
+}
 
+static void emit(const char* name, int color, const char* msg) {
+    std::string ts = stamp();
     if (g_color) {
         const char* c = (color >= 0) ? PALETTE[color % 8] : "90";
-        printf("\033[90m%s\033[0m \033[%sm%-*s |\033[0m %s\n", ts, c, g_width, name, msg);
+        printf("\033[90m%s\033[0m \033[%sm%-*s |\033[0m %s\n", ts.c_str(), c, g_width, name, msg);
     } else {
-        printf("%s %-*s | %s\n", ts, g_width, name, msg);
+        printf("%s %-*s | %s\n", ts.c_str(), g_width, name, msg);
     }
     fflush(stdout);
 }
 
+// Message from a service (or about it). Also remembered for "devrun logs".
 static void say(const Service& s, const char* fmt, ...) {
     char msg[4096];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    s.history.push_back(stamp() + " " + msg);
+    if (s.history.size() > HISTORY_LINES) s.history.pop_front();
+
     emit(s.name.c_str(), s.color, msg);
 }
 
@@ -76,11 +88,14 @@ static void usage() {
         "usage: devrun [command] [options]\n"
         "\n"
         "commands:\n"
-        "  up        start all services and stay in the foreground (default)\n"
-        "  status    show the state of the services of a running devrun\n"
-        "  down      stop a running devrun and all its services\n"
+        "  up          start all services (default); stays in the foreground\n"
+        "  up -d       start all services in the background\n"
+        "  status      show the state of the services of a running devrun\n"
+        "  logs NAME   show recent output of one service\n"
+        "  down        stop a running devrun and all its services\n"
         "\n"
         "options:\n"
+        "  -d, --detach      run in the background (with 'up'); output goes to .devrun.log\n"
         "  -f, --file FILE   config file to use (default: devrun.conf)\n"
         "      --no-color    turn off colors\n"
         "  -h, --help        show this help\n"
@@ -91,7 +106,7 @@ static void usage() {
         "  needs = other, services      (optional)\n"
         "  ready = port 5432            (optional)\n"
         "\n"
-        "Press Ctrl+C to stop all services.\n");
+        "In the foreground, Ctrl+C stops all services.\n");
 }
 
 static Service* find_service(std::vector<Service>& v, const std::string& name) {
@@ -114,7 +129,6 @@ static std::string state_of(const Service& s) {
     return "running";
 }
 
-// Someone connected to our socket: read one command line and answer it.
 static void handle_client(int listen_fd, std::vector<Service>& services) {
     int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (fd < 0) return;
@@ -133,9 +147,19 @@ static void handle_client(int listen_fd, std::vector<Service>& services) {
                      g_width, s.name.c_str(), state_of(s).c_str(), pid.c_str(), s.restarts);
             reply += line;
         }
+    } else if (cmd.rfind("logs ", 0) == 0) {
+        std::string name = cmd.substr(5);
+        Service* s = find_service(services, name);
+        if (!s) {
+            reply = "no such service '" + name + "'\n";
+        } else if (s->history.empty()) {
+            reply = "(no output yet)\n";
+        } else {
+            for (auto& l : s->history) reply += l + "\n";
+        }
     } else if (cmd == "down") {
         reply = "stopping all services...\n";
-        g_stop = 1;     // the main loop notices and runs the normal clean shutdown
+        g_stop = 1;
     } else if (!cmd.empty()) {
         reply = "unknown command\n";
     }
@@ -183,7 +207,7 @@ static void shutdown_all(std::vector<Service>& services) {
     }
 }
 
-// "devrun status" and "devrun down": talk to a running devrun.
+// "devrun status", "devrun logs NAME", "devrun down": talk to a running devrun.
 static int client_command(const std::string& cmd) {
     std::string reply;
     if (!ipc_request(SOCK_PATH, cmd, reply)) {
@@ -203,11 +227,42 @@ static int client_command(const std::string& cmd) {
     return 0;
 }
 
+// Turn this process into a background daemon. The original process exits here,
+// so only the daemon returns. Call it after errors have been reported.
+static void daemonize() {
+    fflush(stdout);
+    fflush(stderr);
+
+    pid_t p = fork();
+    if (p < 0) { perror("fork"); exit(1); }
+    if (p > 0) {
+        printf("devrun started in the background (log: %s)\n", LOG_PATH);
+        printf("use: devrun status | devrun logs NAME | devrun down\n");
+        fflush(stdout);
+        _exit(0);            // _exit: don't run cleanup that would remove the socket
+    }
+
+    setsid();                // new session, no controlling terminal
+
+    p = fork();              // second fork: can never reacquire a terminal
+    if (p < 0) _exit(1);
+    if (p > 0) _exit(0);
+
+    int null_fd = open("/dev/null", O_RDONLY);
+    int log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+    if (log_fd >= 0) {
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+    }
+}
+
 int main(int argc, char** argv) {
     const char* path = "devrun.conf";
     bool no_color = false;
-    std::string cmd = "up";
-    bool cmd_given = false;
+    bool detach = false;
+    std::vector<std::string> words;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -216,6 +271,8 @@ int main(int argc, char** argv) {
             return 0;
         } else if (a == "--no-color") {
             no_color = true;
+        } else if (a == "-d" || a == "--detach") {
+            detach = true;
         } else if (a == "-f" || a == "--file") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s needs a file name\n", a.c_str());
@@ -223,23 +280,35 @@ int main(int argc, char** argv) {
             }
             path = argv[++i];
         } else if (!a.empty() && a[0] != '-') {
-            if (cmd_given) {
-                fprintf(stderr, "only one command allowed (try --help)\n");
-                return 1;
-            }
-            cmd = a;
-            cmd_given = true;
+            words.push_back(a);
         } else {
             fprintf(stderr, "unknown option '%s' (try --help)\n", a.c_str());
             return 1;
         }
     }
 
-    if (cmd != "up" && cmd != "status" && cmd != "down") {
+    std::string cmd = words.empty() ? "up" : words[0];
+
+    if (cmd != "up" && cmd != "status" && cmd != "down" && cmd != "logs") {
         fprintf(stderr, "unknown command '%s' (try --help)\n", cmd.c_str());
         return 1;
     }
+    if (cmd == "logs") {
+        if (words.size() != 2) {
+            fprintf(stderr, "usage: devrun logs NAME\n");
+            return 1;
+        }
+        return client_command("logs " + words[1]);
+    }
+    if (words.size() > 1) {
+        fprintf(stderr, "too many arguments (try --help)\n");
+        return 1;
+    }
     if (cmd == "status" || cmd == "down") return client_command(cmd);
+    if (detach && cmd != "up") {
+        fprintf(stderr, "-d only works with 'up'\n");
+        return 1;
+    }
 
     g_color = isatty(STDOUT_FILENO) && !no_color && !getenv("NO_COLOR");
 
@@ -259,6 +328,11 @@ int main(int argc, char** argv) {
     if (listen_fd < 0) {
         fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
+    }
+
+    if (detach) {
+        daemonize();         // only the final background process continues past here
+        g_color = false;
     }
 
     struct sigaction sa = {};
@@ -321,14 +395,13 @@ int main(int argc, char** argv) {
         if (waiting && (timeout < 0 || timeout > CHECK_INTERVAL_MS)) timeout = CHECK_INTERVAL_MS;
 
         std::vector<pollfd> fds;
-        std::vector<int> who;       // index into services, or -1 for the listening socket
+        std::vector<int> who;
         for (int i = 0; i < (int)services.size(); i++) {
             if (services[i].fd >= 0) {
                 fds.push_back({services[i].fd, POLLIN, 0});
                 who.push_back(i);
             }
         }
-        // Nothing running and nothing scheduled: we're done (checked before adding the socket).
         if (fds.empty() && !pending && !waiting) break;
 
         fds.push_back({listen_fd, POLLIN, 0});

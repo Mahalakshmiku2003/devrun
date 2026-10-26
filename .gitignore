@@ -1,2 +1,3 @@
 build/
 .devrun.sock
+.devrun.log
