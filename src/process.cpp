@@ -9,14 +9,16 @@ bool start_service(Service& s) {
     if (pid < 0) return false;
 
     if (pid == 0) {
+        setpgid(0, 0);                  // own process group, so we can stop it and its children together
         close(tube[0]);
         dup2(tube[1], STDOUT_FILENO);
-        dup2(tube[1], STDERR_FILENO);   // errors go to the same tube
+        dup2(tube[1], STDERR_FILENO);
         close(tube[1]);
         execlp("sh", "sh", "-c", s.command.c_str(), nullptr);
         _exit(127);
     }
 
+    setpgid(pid, pid);                  // set it from the parent too, to avoid a timing race
     close(tube[1]);
     s.fd = tube[0];
     s.pid = pid;
