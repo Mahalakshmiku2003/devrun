@@ -13,21 +13,20 @@ static const int MAX_RESTARTS = 5;
 static const int GRACE_MS = 3000;
 
 static volatile sig_atomic_t g_stop = 0;
-static void on_signal(int) { g_stop = 1; }   // only set a flag; do the real work in the loop
+static void on_signal(int) { g_stop = 1; }
 
 static long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Stop everything: polite SIGTERM first, SIGKILL for anything still alive after GRACE_MS.
 static void shutdown_all(std::vector<Service>& services) {
     printf("\nshutting down...\n");
     fflush(stdout);
 
     for (auto& s : services) {
-        s.restart_at_ms = 0;                       // cancel pending restarts
-        if (s.pid > 0) kill(-s.pid, SIGTERM);      // negative pid = the whole process group
+        s.restart_at_ms = 0;
+        if (s.pid > 0) kill(-s.pid, SIGTERM);
     }
 
     long long deadline = now_ms() + GRACE_MS;
@@ -71,16 +70,32 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Catch Ctrl+C (SIGINT) and SIGTERM. No SA_RESTART, so poll() wakes up when a signal arrives.
     struct sigaction sa = {};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Services are already sorted so dependencies come first.
+    printf("start order:");
+    for (auto& s : services) printf(" %s", s.name.c_str());
+    printf("\n");
+
     for (auto& s : services) {
-        if (!start_service(s)) printf("[%s] failed to start\n", s.name.c_str());
+        bool blocked = false;
+        for (auto& n : s.needs) {
+            for (auto& other : services) {
+                if (other.name == n && !other.started) blocked = true;
+            }
+        }
+        if (blocked) {
+            printf("[%s] not started: a dependency failed to start\n", s.name.c_str());
+            continue;
+        }
+        if (start_service(s)) s.started = true;
+        else printf("[%s] failed to start\n", s.name.c_str());
     }
+    fflush(stdout);
 
     while (!g_stop) {
         long long now = now_ms();
@@ -107,7 +122,7 @@ int main(int argc, char** argv) {
 
         int r = poll(fds.data(), fds.size(), timeout);
         if (r < 0) {
-            if (errno == EINTR) continue;   // a signal woke us; the loop condition checks g_stop
+            if (errno == EINTR) continue;
             break;
         }
 
