@@ -1,10 +1,18 @@
 #include "process.hpp"
 #include "config.hpp"
+#include <chrono>
 #include <cstdio>
 #include <vector>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/wait.h>
+
+static const int MAX_RESTARTS = 5;
+
+static long long now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 int main(int argc, char** argv) {
     std::vector<Service> services;
@@ -20,6 +28,19 @@ int main(int argc, char** argv) {
     }
 
     while (true) {
+        // Work out how long poll may sleep: until the next scheduled restart
+        long long now = now_ms();
+        int timeout = -1;          // -1 = sleep until data arrives
+        bool pending = false;
+        for (auto& s : services) {
+            if (s.restart_at_ms > 0) {
+                pending = true;
+                long long wait = s.restart_at_ms - now;
+                if (wait < 0) wait = 0;
+                if (timeout < 0 || wait < timeout) timeout = (int)wait;
+            }
+        }
+
         std::vector<pollfd> fds;
         std::vector<int> who;
         for (int i = 0; i < (int)services.size(); i++) {
@@ -28,10 +49,11 @@ int main(int argc, char** argv) {
                 who.push_back(i);
             }
         }
-        if (fds.empty()) break;
+        if (fds.empty() && !pending) break;   // nothing running, nothing to restart
 
-        poll(fds.data(), fds.size(), -1);
+        poll(fds.data(), fds.size(), timeout);
 
+        // 1. Read output / detect exits
         for (size_t k = 0; k < fds.size(); k++) {
             if (!fds[k].revents) continue;
             Service& s = services[who[k]];
@@ -50,9 +72,35 @@ int main(int argc, char** argv) {
                 s.fd = -1;
                 int status;
                 waitpid(s.pid, &status, 0);
-                printf("[%s] exited with code %d\n", s.name.c_str(), WEXITSTATUS(status));
+                int code = WIFEXITED(status) ? WEXITSTATUS(status)
+                                             : 128 + WTERMSIG(status);
+                printf("[%s] exited with code %d\n", s.name.c_str(), code);
+
+                if (code != 0) {
+                    if (s.restarts < MAX_RESTARTS) {
+                        long long delay = 1000LL << s.restarts;   // 1s, 2s, 4s...
+                        s.restarts++;
+                        s.restart_at_ms = now_ms() + delay;
+                        printf("[%s] crashed, restarting in %lld s (attempt %d of %d)\n",
+                               s.name.c_str(), delay / 1000, s.restarts, MAX_RESTARTS);
+                    } else {
+                        printf("[%s] crashed too many times, giving up\n", s.name.c_str());
+                    }
+                }
             }
             fflush(stdout);
+        }
+
+        // 2. Start any service whose restart time has arrived
+        now = now_ms();
+        for (auto& s : services) {
+            if (s.restart_at_ms > 0 && now >= s.restart_at_ms) {
+                s.restart_at_ms = 0;
+                s.buf.clear();
+                printf("[%s] restarting now\n", s.name.c_str());
+                if (!start_service(s)) printf("[%s] failed to start\n", s.name.c_str());
+                fflush(stdout);
+            }
         }
     }
     return 0;
