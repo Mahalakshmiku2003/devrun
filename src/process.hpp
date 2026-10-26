@@ -7,11 +7,12 @@ struct Service {
     std::string name;
     std::string command;
     std::vector<std::string> needs;
-    int ready_port = 0;               // 0 = no health check; ready as soon as started
+    int ready_port = 0;
     bool started = false;
     bool ready = false;
-    bool failed = false;              // gave up, or a dependency failed
+    bool failed = false;
     long long started_at_ms = 0;
+    int color = 0;                    // index into the color palette
     int fd = -1;
     std::string buf;
     pid_t pid = -1;

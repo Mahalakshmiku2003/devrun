@@ -4,7 +4,11 @@
 #include <chrono>
 #include <csignal>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <string>
 #include <vector>
 #include <poll.h>
 #include <unistd.h>
@@ -14,13 +18,73 @@ static const int MAX_RESTARTS = 5;
 static const int GRACE_MS = 3000;
 static const int READY_TIMEOUT_MS = 15000;
 static const int CHECK_INTERVAL_MS = 200;
+static const int STABLE_MS = 60000;   // ran this long before crashing = counter resets
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
 
+static bool g_color = false;
+static int g_width = 6;
+static const char* PALETTE[] = {"36", "32", "33", "35", "34", "91", "92", "96"};
+
 static long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Prints one log line: "HH:MM:SS name | message", colored per service.
+static void emit(const char* name, int color, const char* msg) {
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+
+    if (g_color) {
+        const char* c = (color >= 0) ? PALETTE[color % 8] : "90";
+        printf("\033[90m%s\033[0m \033[%sm%-*s |\033[0m %s\n", ts, c, g_width, name, msg);
+    } else {
+        printf("%s %-*s | %s\n", ts, g_width, name, msg);
+    }
+    fflush(stdout);
+}
+
+// Message from a service (or about a service).
+static void say(const Service& s, const char* fmt, ...) {
+    char msg[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    emit(s.name.c_str(), s.color, msg);
+}
+
+// Message from devrun itself.
+static void note(const char* fmt, ...) {
+    char msg[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    emit("devrun", -1, msg);
+}
+
+static void usage() {
+    printf(
+        "devrun - run several dev services from one config file\n"
+        "\n"
+        "usage: devrun [options]\n"
+        "  -f, --file FILE   config file to use (default: devrun.conf)\n"
+        "      --no-color    turn off colors\n"
+        "  -h, --help        show this help\n"
+        "\n"
+        "config format:\n"
+        "  [name]\n"
+        "  cmd   = command to run\n"
+        "  needs = other, services      (optional)\n"
+        "  ready = port 5432            (optional)\n"
+        "\n"
+        "Press Ctrl+C to stop all services.\n");
 }
 
 static Service* find_service(std::vector<Service>& v, const std::string& name) {
@@ -31,12 +95,11 @@ static Service* find_service(std::vector<Service>& v, const std::string& name) {
 static void mark_started(Service& s) {
     s.started = true;
     s.started_at_ms = now_ms();
-    s.ready = (s.ready_port == 0);   // no health check: ready right away
+    s.ready = (s.ready_port == 0);
 }
 
 static void shutdown_all(std::vector<Service>& services) {
-    printf("\nshutting down...\n");
-    fflush(stdout);
+    note("shutting down...");
 
     for (auto& s : services) {
         s.restart_at_ms = 0;
@@ -51,7 +114,7 @@ static void shutdown_all(std::vector<Service>& services) {
             int status;
             pid_t r = waitpid(s.pid, &status, WNOHANG);
             if (r == s.pid) {
-                printf("[%s] stopped\n", s.name.c_str());
+                say(s, "stopped");
                 s.pid = -1;
             } else {
                 any = true;
@@ -63,7 +126,7 @@ static void shutdown_all(std::vector<Service>& services) {
 
     for (auto& s : services) {
         if (s.pid <= 0) continue;
-        printf("[%s] did not stop, sending SIGKILL\n", s.name.c_str());
+        say(s, "did not stop, sending SIGKILL");
         kill(-s.pid, SIGKILL);
         waitpid(s.pid, nullptr, 0);
         s.pid = -1;
@@ -72,16 +135,45 @@ static void shutdown_all(std::vector<Service>& services) {
     for (auto& s : services) {
         if (s.fd >= 0) { close(s.fd); s.fd = -1; }
     }
-    fflush(stdout);
 }
 
 int main(int argc, char** argv) {
+    const char* path = "devrun.conf";
+    bool no_color = false;
+
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "-h" || a == "--help") {
+            usage();
+            return 0;
+        } else if (a == "--no-color") {
+            no_color = true;
+        } else if (a == "-f" || a == "--file") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s needs a file name\n", a.c_str());
+                return 1;
+            }
+            path = argv[++i];
+        } else if (!a.empty() && a[0] != '-') {
+            path = argv[i];           // plain file name also works
+        } else {
+            fprintf(stderr, "unknown option '%s' (try --help)\n", a.c_str());
+            return 1;
+        }
+    }
+
+    g_color = isatty(STDOUT_FILENO) && !no_color && !getenv("NO_COLOR");
+
     std::vector<Service> services;
     std::string error;
-    const char* path = (argc > 1) ? argv[1] : "devrun.conf";
     if (!load_config(path, services, error)) {
         fprintf(stderr, "config error: %s\n", error.c_str());
         return 1;
+    }
+
+    for (size_t i = 0; i < services.size(); i++) {
+        services[i].color = (int)i;
+        if ((int)services[i].name.size() > g_width) g_width = (int)services[i].name.size();
     }
 
     struct sigaction sa = {};
@@ -90,10 +182,11 @@ int main(int argc, char** argv) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    printf("start order:");
-    for (auto& s : services) printf(" %s", s.name.c_str());
-    printf("\n");
-    fflush(stdout);
+    {
+        std::string order;
+        for (auto& s : services) order += " " + s.name;
+        note("start order:%s", order.c_str());
+    }
 
     while (!g_stop) {
         // A. Start services whose dependencies are ready; check readiness of the rest.
@@ -109,25 +202,22 @@ int main(int argc, char** argv) {
                     else if (!d->ready) all_ready = false;
                 }
                 if (dep_failed) {
-                    printf("[%s] not started: a dependency failed\n", s.name.c_str());
+                    say(s, "not started: a dependency failed");
                     s.failed = true;
                 } else if (all_ready) {
                     if (start_service(s)) mark_started(s);
-                    else { printf("[%s] failed to start\n", s.name.c_str()); s.failed = true; }
+                    else { say(s, "failed to start"); s.failed = true; }
                 }
             } else if (!s.ready) {
                 if (tcp_check(s.ready_port)) {
                     s.ready = true;
-                    printf("[%s] ready (port %d is accepting connections)\n",
-                           s.name.c_str(), s.ready_port);
+                    say(s, "ready (port %d is accepting connections)", s.ready_port);
                 } else if (now_ms() - s.started_at_ms > READY_TIMEOUT_MS) {
-                    printf("[%s] not ready after %d s, giving up on it\n",
-                           s.name.c_str(), READY_TIMEOUT_MS / 1000);
+                    say(s, "not ready after %d s, giving up on it", READY_TIMEOUT_MS / 1000);
                     s.failed = true;
                 }
             }
         }
-        fflush(stdout);
 
         // B. Decide how long poll may sleep.
         long long now = now_ms();
@@ -172,7 +262,7 @@ int main(int argc, char** argv) {
                 s.buf.append(tmp, n);
                 size_t pos;
                 while ((pos = s.buf.find('\n')) != std::string::npos) {
-                    printf("[%s] %s\n", s.name.c_str(), s.buf.substr(0, pos).c_str());
+                    say(s, "%s", s.buf.substr(0, pos).c_str());
                     s.buf.erase(0, pos + 1);
                 }
             } else {
@@ -183,22 +273,25 @@ int main(int argc, char** argv) {
                 s.pid = -1;
                 int code = WIFEXITED(status) ? WEXITSTATUS(status)
                                              : 128 + WTERMSIG(status);
-                printf("[%s] exited with code %d\n", s.name.c_str(), code);
+                say(s, "exited with code %d", code);
 
                 if (code != 0) {
+                    if (s.restarts > 0 && now_ms() - s.started_at_ms >= STABLE_MS) {
+                        s.restarts = 0;
+                        say(s, "ran stably for %d s, restart counter reset", STABLE_MS / 1000);
+                    }
                     if (s.restarts < MAX_RESTARTS) {
                         long long delay = 1000LL << s.restarts;
                         s.restarts++;
                         s.restart_at_ms = now_ms() + delay;
-                        printf("[%s] crashed, restarting in %lld s (attempt %d of %d)\n",
-                               s.name.c_str(), delay / 1000, s.restarts, MAX_RESTARTS);
+                        say(s, "crashed, restarting in %lld s (attempt %d of %d)",
+                            delay / 1000, s.restarts, MAX_RESTARTS);
                     } else {
-                        printf("[%s] crashed too many times, giving up\n", s.name.c_str());
+                        say(s, "crashed too many times, giving up");
                         s.failed = true;
                     }
                 }
             }
-            fflush(stdout);
         }
 
         // D. Restart services whose time has come.
@@ -207,10 +300,9 @@ int main(int argc, char** argv) {
             if (s.restart_at_ms > 0 && now >= s.restart_at_ms) {
                 s.restart_at_ms = 0;
                 s.buf.clear();
-                printf("[%s] restarting now\n", s.name.c_str());
+                say(s, "restarting now");
                 if (start_service(s)) mark_started(s);
-                else printf("[%s] failed to start\n", s.name.c_str());
-                fflush(stdout);
+                else say(s, "failed to start");
             }
         }
     }
