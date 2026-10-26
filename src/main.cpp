@@ -1,6 +1,7 @@
 #include "process.hpp"
 #include "config.hpp"
 #include "health.hpp"
+#include "ipc.hpp"
 #include <chrono>
 #include <csignal>
 #include <cerrno>
@@ -12,13 +13,15 @@
 #include <vector>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 
 static const int MAX_RESTARTS = 5;
 static const int GRACE_MS = 3000;
 static const int READY_TIMEOUT_MS = 15000;
 static const int CHECK_INTERVAL_MS = 200;
-static const int STABLE_MS = 60000;   // ran this long before crashing = counter resets
+static const int STABLE_MS = 60000;
+static const char* SOCK_PATH = ".devrun.sock";
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
@@ -32,7 +35,6 @@ static long long now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Prints one log line: "HH:MM:SS name | message", colored per service.
 static void emit(const char* name, int color, const char* msg) {
     time_t t = time(nullptr);
     struct tm tmv;
@@ -49,7 +51,6 @@ static void emit(const char* name, int color, const char* msg) {
     fflush(stdout);
 }
 
-// Message from a service (or about a service).
 static void say(const Service& s, const char* fmt, ...) {
     char msg[4096];
     va_list ap;
@@ -59,7 +60,6 @@ static void say(const Service& s, const char* fmt, ...) {
     emit(s.name.c_str(), s.color, msg);
 }
 
-// Message from devrun itself.
 static void note(const char* fmt, ...) {
     char msg[4096];
     va_list ap;
@@ -73,7 +73,14 @@ static void usage() {
     printf(
         "devrun - run several dev services from one config file\n"
         "\n"
-        "usage: devrun [options]\n"
+        "usage: devrun [command] [options]\n"
+        "\n"
+        "commands:\n"
+        "  up        start all services and stay in the foreground (default)\n"
+        "  status    show the state of the services of a running devrun\n"
+        "  down      stop a running devrun and all its services\n"
+        "\n"
+        "options:\n"
         "  -f, --file FILE   config file to use (default: devrun.conf)\n"
         "      --no-color    turn off colors\n"
         "  -h, --help        show this help\n"
@@ -96,6 +103,45 @@ static void mark_started(Service& s) {
     s.started = true;
     s.started_at_ms = now_ms();
     s.ready = (s.ready_port == 0);
+}
+
+static std::string state_of(const Service& s) {
+    if (s.failed) return "failed";
+    if (s.restart_at_ms > 0) return "restarting";
+    if (!s.started) return "waiting";
+    if (s.pid < 0) return "exited";
+    if (!s.ready) return "starting";
+    return "running";
+}
+
+// Someone connected to our socket: read one command line and answer it.
+static void handle_client(int listen_fd, std::vector<Service>& services) {
+    int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (fd < 0) return;
+
+    std::string cmd = ipc_read_line(fd, 500);
+    std::string reply;
+
+    if (cmd == "status") {
+        char line[256];
+        snprintf(line, sizeof(line), "%-*s  %-11s  %-7s  %s\n",
+                 g_width, "NAME", "STATE", "PID", "RESTARTS");
+        reply += line;
+        for (auto& s : services) {
+            std::string pid = (s.pid > 0) ? std::to_string(s.pid) : "-";
+            snprintf(line, sizeof(line), "%-*s  %-11s  %-7s  %d\n",
+                     g_width, s.name.c_str(), state_of(s).c_str(), pid.c_str(), s.restarts);
+            reply += line;
+        }
+    } else if (cmd == "down") {
+        reply = "stopping all services...\n";
+        g_stop = 1;     // the main loop notices and runs the normal clean shutdown
+    } else if (!cmd.empty()) {
+        reply = "unknown command\n";
+    }
+
+    ipc_reply(fd, reply);
+    close(fd);
 }
 
 static void shutdown_all(std::vector<Service>& services) {
@@ -137,9 +183,31 @@ static void shutdown_all(std::vector<Service>& services) {
     }
 }
 
+// "devrun status" and "devrun down": talk to a running devrun.
+static int client_command(const std::string& cmd) {
+    std::string reply;
+    if (!ipc_request(SOCK_PATH, cmd, reply)) {
+        fprintf(stderr, "devrun is not running in this folder\n");
+        return 1;
+    }
+    fputs(reply.c_str(), stdout);
+
+    if (cmd == "down") {
+        for (int i = 0; i < 100 && ipc_alive(SOCK_PATH); i++) usleep(100 * 1000);
+        if (ipc_alive(SOCK_PATH)) {
+            fprintf(stderr, "still shutting down after 10 s\n");
+            return 1;
+        }
+        printf("stopped\n");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const char* path = "devrun.conf";
     bool no_color = false;
+    std::string cmd = "up";
+    bool cmd_given = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -155,12 +223,23 @@ int main(int argc, char** argv) {
             }
             path = argv[++i];
         } else if (!a.empty() && a[0] != '-') {
-            path = argv[i];           // plain file name also works
+            if (cmd_given) {
+                fprintf(stderr, "only one command allowed (try --help)\n");
+                return 1;
+            }
+            cmd = a;
+            cmd_given = true;
         } else {
             fprintf(stderr, "unknown option '%s' (try --help)\n", a.c_str());
             return 1;
         }
     }
+
+    if (cmd != "up" && cmd != "status" && cmd != "down") {
+        fprintf(stderr, "unknown command '%s' (try --help)\n", cmd.c_str());
+        return 1;
+    }
+    if (cmd == "status" || cmd == "down") return client_command(cmd);
 
     g_color = isatty(STDOUT_FILENO) && !no_color && !getenv("NO_COLOR");
 
@@ -174,6 +253,12 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < services.size(); i++) {
         services[i].color = (int)i;
         if ((int)services[i].name.size() > g_width) g_width = (int)services[i].name.size();
+    }
+
+    int listen_fd = ipc_listen(SOCK_PATH, error);
+    if (listen_fd < 0) {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
     }
 
     struct sigaction sa = {};
@@ -236,14 +321,18 @@ int main(int argc, char** argv) {
         if (waiting && (timeout < 0 || timeout > CHECK_INTERVAL_MS)) timeout = CHECK_INTERVAL_MS;
 
         std::vector<pollfd> fds;
-        std::vector<int> who;
+        std::vector<int> who;       // index into services, or -1 for the listening socket
         for (int i = 0; i < (int)services.size(); i++) {
             if (services[i].fd >= 0) {
                 fds.push_back({services[i].fd, POLLIN, 0});
                 who.push_back(i);
             }
         }
+        // Nothing running and nothing scheduled: we're done (checked before adding the socket).
         if (fds.empty() && !pending && !waiting) break;
+
+        fds.push_back({listen_fd, POLLIN, 0});
+        who.push_back(-1);
 
         int r = poll(fds.data(), fds.size(), timeout);
         if (r < 0) {
@@ -251,11 +340,16 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // C. Read output / detect exits.
+        // C. Handle clients, read output, detect exits.
         for (size_t k = 0; k < fds.size(); k++) {
             if (!fds[k].revents) continue;
-            Service& s = services[who[k]];
 
+            if (who[k] < 0) {
+                handle_client(listen_fd, services);
+                continue;
+            }
+
+            Service& s = services[who[k]];
             char tmp[512];
             ssize_t n = read(s.fd, tmp, sizeof(tmp));
             if (n > 0) {
@@ -308,5 +402,8 @@ int main(int argc, char** argv) {
     }
 
     if (g_stop) shutdown_all(services);
+
+    close(listen_fd);
+    unlink(SOCK_PATH);
     return 0;
 }
